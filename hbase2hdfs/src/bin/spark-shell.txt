@@ -1,0 +1,7 @@
+val json = sqlContext.read.json("/madplatform/analytics/admta/201708*/*")
+val explodeDF = json.withColumn("resone", org.apache.spark.sql.functions.explode(json("results")))
+val selectDF = explodeDF.selectExpr("deviceId", "deviceType", "resone.dealid as dealid", "resone.resultCode as rescode", "timestamp").filter("dealid = '1102747' and rescode = '1005'")
+selectDF.cache()
+val r = selectDF.selectExpr("deviceId", "deviceType").dropDuplicates
+r.show(10,false)
+r.coalesce(4).write.mode("overwrite").format("parquet").save("/tmp/whsh/retargeting")

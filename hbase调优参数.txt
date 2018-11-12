@@ -1,0 +1,203 @@
+重试：
+客户端参数优化实践
+很显然，根据上面第二部分和第三部分的介绍，一旦在网络出现抖动的异常情况下，默认最差情况下一个线程会存在8min左右的重试时间，从而会导致其他线程都阻塞在regionLockObject这把全局锁上。为了构建一个更稳定、低延迟的HBase系统，除过需要对服务器端参数做各种调整外，客户端参数也需要做相应的调整：
+1. hbase.client.pause:默认为100，可以减少为50
+2. hbase.client.retries.number:默认为31，可以减少为21
+修改后，通过上面算法可以计算出每次连接集群重试之间的暂停时间将依次为：
+［50，100，150，250，500，1000，2000，5000，5000，5000，5000，10000，10000，…，10000］
+客户端将会在2min内重试20次，然后放弃连接到集群，进而会再将全局锁交给其他线程，执行其他请求。 
+
+
+超时：
+
+hbase.rpc.timeout  默认60000ms 
+从字面意思就可知道，该参数表示一次RPC请求的超时时间。如果某次RPC时间超过该值，客户端就会主动关闭socket。 
+
+hbase.client.operation.timeout
+该参数表示HBase客户端发起一次数据操作直至得到响应之间总的超时时间，数据操作类型包括get、append、increment、delete、put等。
+
+hbase.client.scanner.timeout.period
+scan操作却是最有可能发生超时的，也因此是用户最为关心的。HBase当然考虑到了这点，并提供了一个单独的超时参数进行设置
+
+ 1.  上文提到一次大的scan操作会被拆分为多个RPC请求，那到底会拆分为多少个呢？
+一次scan请求的RPC次数主要和两个因素相关，一个是本次scan的待检索条数，另一个是单次RPC请求的数据条数，很显然，两者的比值就是RPC请求次数。
+一次scan的待检索条数由用户设置的条件决定，比如用户想一次获取某个用户最近一个月的所有操作信息，这些信息总和为10w条，那一次scan总扫瞄条数就是10w条。
+为了防止一次scan操作请求的数据量太大，额外提供了参数maxResultSize对总检索结果大小进行限制，该参数表示一次scan最多可以请求的数据量大小，默认为-1，表示无限制。
+单次RPC请求的数据条数由参数caching设定，默认为100条。因为每次RPC请求获取到数据都会缓存到客户端，因此该值如果设置过大，可能会因为一次获取到的数据
+量太大导致客户端内存oom；而如果设置太小会导致一次大scan进行太多次RPC，网络成本高。
+
+2. 经常有业务童鞋问道，在scan过程中RegionServer端偶尔抛出leaseException，是怎么回事？
+看到leaseException就会想到租约机制，的确，HBase内部在一次完整的scan操作中引入了租约机制。为什么需要租约机制？这和整个scan操作流程有莫大的关系，
+上文讲到，一次完整的scan通常会被拆分为多个RPC请求，实际实现中，RegionServer接收到第一次RPC请求之后，会为该scan操作生成一个全局唯一的id，称为
+scanId。除此之外，RegionServer还会进行大量的准备工作，构建整个scan体系，构造需要用到的所有对象，后续的RPC请求只需要携带相同的scanId作为标示就
+可以直接利用这些已经构建好的资源进行检索。也就是说，在整个scan过程中，客户端其实都占用着服务器端的资源，此时如果此客户端意外宕机，是否就意味着
+这些资源永远都不能得到释放呢？租约机制就是为了解决这个问题。RegionServer接收到第一次RPC之后，除了生成全局唯一的scanId之外还会生成一个携带有超
+时时间的lease，超时时间可以通过参数hbase.regionserver.lease.period配置，一旦在超时时间内后续RPC请求没有到来（比如客户端处理太慢），RegionServer
+就认为客户端出现异常，此时会将该lease销毁并将整个scan所持有的资源全部释放，客户端在处理完成之后再发后续的RPC过来，检查到对应的lease已经不存在
+
+Confiuration conf = HBaseConfiguration.create();
+conf.setInt("hbase.rpc.timeout",20000);
+conf.setInt("hbase.client.operation.timeout”,30000);
+conf.setInt("hbase.client.scanner.timeout.period",20000);
+HTable table = new HTable(conf,"tableName");
+
+
+
+<property>
+	<name>hbase.client.keyvalue.maxsize</name>
+	<value>1048576000</value>
+</property>
+<property>
+    <name>hbase.regionserver.lease.period</name>
+    <value>240000</value>
+</property>
+<property>
+    <name>hbase.rpc.timeout</name>
+    <value>280000</value>
+</property>
+<property>
+    <name>hbase.regionserver.handler.count</name>
+    <value>20</value>
+</property>
+
+
+
+export HBASE_OPTS="-verbose:gc -XX:+PrintGCDetails -Xloggc:${HBASE_LOG_DIR}/hbase-gc.log -XX:+PrintGCTimeStamps -XX:+PrintGCApplicationConcurrentTime -XX:+PrintGCApplicationStoppedTime \
+-server -Xmx20480m -Xms20480m -Xmn10240m -Xss256k  -XX:SurvivorRatio=4 -XX:MaxPermSize=256m -XX:MaxTenuringThreshold=15 \
+-XX:ParallelGCThreads=16 -XX:+UseConcMarkSweepGC -XX:+UseParNewGC  -XX:CMSFullGCsBeforeCompaction=5 -XX:+UseCMSCompactAtFullCollection \
+-XX:+CMSClassUnloadingEnabled  -XX:CMSInitiatingOccupancyFraction=70 -XX:+UseCMSInitiatingOccupancyOnly -XX:CMSMaxAbortablePrecleanTime=5000     \
+"
+export HBASE_OPTS="$HBASE_OPTS -XX:+UseCompressedOops -XX:+UseParNewGC -XX:+UseConcMarkSweepGC -XX:+CMSClassUnloadingEnabled \
+-XX:+UseCMSCompactAtFullCollection -XX:CMSFullGCsBeforeCompaction=0 -XX:+CMSParallelRemarkEnabled  -XX:CMSInitiatingOccupancyFraction=75 \
+-XX:SoftRefLRUPolicyMSPerMB=0
+
+
+18.4. Query Shell Configuration
+
+hbase(main):001:0> @shell.hbase.configuration.get("hbase.rpc.timeout")
+=> "60000"
+
+@shell.hbase.configuration.get("hbase.hconnection.threads.max")
+
+
+To set a config in the shell:
+
+hbase(main):005:0> @shell.hbase.configuration.setInt("hbase.rpc.timeout", 61010)
+hbase(main):006:0> @shell.hbase.configuration.get("hbase.rpc.timeout")
+=> "61010"
+
+
+
+  
+读和写分离，位于不同的tomcat实例，数据先写入redis队列，再异步写入hbase，如果写失败再回存redis队列，
+先读redis缓存的数据（如果有缓存，需要注意这里的redis缓存不是redis队列），如果没有读到再读hbase。
+
+-XX:SurvivorRatio=2  -XX:+PrintGCDateStamps  -Xloggc:$HBASE_LOG_DIR/gc-regionserver.log -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=1 -XX:GCLogFileSize=512M -server -Xmx64g -Xms64g -Xmn2g -Xss256k -XX:PermSize=256m -XX:MaxPermSize=256m -XX:+UseParNewGC -XX:MaxTenuringThreshold=15  -XX:+CMSParallelRemarkEnabled -XX:+UseCMSCompactAtFullCollection -XX:+CMSClassUnloadingEnabled -XX:+UseCMSInitiatingOccupancyOnly -XX:CMSInitiatingOccupancyFraction=75 -XX:-DisableExplicitGC
+-XX:SurvivorRatio=2  -XX:+PrintGCDateStamps  -Xloggc:$HBASE_LOG_DIR/gc-regionserver.log -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=1 -XX:GCLogFileSize=512M -server -Xmx40g -Xms40g -Xmn1g -Xss256k -XX:PermSize=256m -XX:MaxPermSize=256m -XX:+UseParNewGC -XX:MaxTenuringThreshold=15  -XX:+CMSParallelRemarkEnabled -XX:+UseCMSCompactAtFullCollection -XX:+CMSClassUnloadingEnabled -XX:+UseCMSInitiatingOccupancyOnly -XX:CMSInitiatingOccupancyFraction=75 -XX:-DisableExplicitGC
+
+-XX:+UseCompressedOops -XX:+UseParNewGC -XX:+UseConcMarkSweepGC -XX:+CMSClassUnloadingEnabled -XX:+UseCMSCompactAtFullCollection -XX:CMSFullGCsBeforeCompaction=0 -XX:+CMSParallelRemarkEnabled  -XX:CMSInitiatingOccupancyFraction=75 -XX:SoftRefLRUPolicyMSPerMB=0
+
+<property>
+    <name>hbase.bucketcache.ioengine</name>
+    <value>offheap</value>
+</property>
+<property>
+    <name>hbase.bucketcache.size</name>
+    <value>2048</value>
+</property>
+<property>
+    <name>hbase.bucketcache.percentage.in.combinedcache</name>
+    <value>0.67</value>
+</property>
+
+
+
+
+hbase：
+配置文件：hbase-env.sh hbase-site.xml slave
+hbase.regionserver.handler.count
+启动hbase：$ bin/start-hbase.sh
+web查看：http://192.168.0.162:16010/master-status （之前的端口是60010）
+状态查看：
+在主节点  jps 出现  Hmaster 和 HquorumPeer
+在slave   jps 出现  HregionServer 和 HquorumPeer 
+shell命令： hbase shell
+status
+version
+
+list
+create 
+describe
+alter
+disable
+enable
+drop
+exists
+is_enabled
+
+put
+格式: put 表名,行名,列名([列族:列名]),值
+get
+格式：get 表明,行名
+get 'test', 'row2'
+get 'test', 'row2', 'cf:b'
+get 'test', 'row2', {COLUMN=>'cf:b'}
+get 'test', 'row2', {COLUMNS=>'cf:b'}
+scan
+scan 'test'
+scan 'user_test',{COLUMNS =>'info:username',LIMIT =>10, STARTROW => 'test', STOPROW=>'test2'}
+count
+truncate
+incr
+delete
+deleteall
+
+
+create 'maddsp_multiplefusion_data','cf'
+create 'label_test_new','cf'
+
+
+put <table>,<rowkey>,<family:column>,<value>
+put 'maddsp_multiplefusion_data','d34e9326-7169-4b99-8cb3-995cb7c4bafc:ifa','cf:ap_023047','1'
+
+put 'maddsp_multiplefusion_data','5659e4c5-aece-4ebc-897f-b33fca05cbf1:ifa','cf:ap_023047','1'
+put 'maddsp_multiplefusion_data','d1752868-3630-45da-bb84-2f53d2f4f0f5:ifa','cf:ap_023047','1'
+
+put 'maddsp_multiplefusion_data','d1752868-3630-45da-bb84-2f53d2f4f0f5:ifa','cf:ap_023047','1'
+
+put 'maddsp_multiplefusion_data','d7d408f7-4aba-422b-8bcd-0e1d99e8d87b:ifa','cf:ap_023047','1'
+
+put 'maddsp_multiplefusion_data','b9ffeb9c-130a-4527-8ce6-b97fd14a04de:ifa','cf:ap_023047','1'
+
+put 'maddsp_multiplefusion_data','daf23394-2d89-41a5-b28f-f773698dd40d:ifa','cf:ap_023047','1'
+
+describe 'maddsp_multiplefusion_data'
+disable 'maddsp_multiplefusion_data'
+alter 'maddsp_multiplefusion_data',{NAME => 'cf', BLOOMFILTER => 'ROW'}
+enable 'maddsp_multiplefusion_data'
+
+scan 'maddsp_multiplefusion_data',{COLUMNS=>['cf:'],FILTER=>"(ColumnPrefixFilter('ap_023010'))", LIMIT => 5}
+
+/etc/init.d/hbase-regionserver status
+
+
+create 'maddsp_multiplefusion_data','cf'
+create 'label_test_new',{NAME=>'cf',BLOOMFILTER =>'ROW',COMPRESSION=>'SNAPPY',VERSIONS=>'2'},{NUMREGIONS => 120, SPLITALGO => 'HexStringSplit'}
+
+create 'maddsp_multiplefusion_data',{NAME=>'cf',BLOOMFILTER =>'ROW',COMPRESSION=>'SNAPPY',VERSIONS=>'2'},{NUMREGIONS => 120, SPLITALGO => 'HexStringSplit'}
+
+create 'maddsp_multiplefusion_data',{NAME=>'cf',BLOOMFILTER =>'ROW',COMPRESSION=>'LZO',VERSIONS=>'2'},{NUMREGIONS => 120, SPLITALGO => 'HexStringSplit'}
+
+
+create 'maddsp_multiplefusion_data',{NAME=>'cf',BLOOMFILTER =>'ROW',VERSIONS=>'2'},{NUMREGIONS => 64, SPLITALGO => 'HexStringSplit'}
+
+
+hadoop dfsadmin -safemode leave
+
+hbase表存在错误解决办法：
+通过./hbase zkcli命令进入zookeeper client模式，在zk client模式下输入ls /hbase/table命令看到zombie table，
+然后使用rmr /hbase/table/TABLE_NAME命令删除zombie table，重启hbase即可
+
+
+
+
